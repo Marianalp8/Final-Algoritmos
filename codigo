@@ -1,1 +1,228 @@
+import numpy as np
+import math
+import json
+import os
 
+# Intento leer parámetros desde benchmark.xlsm si existe (opcional).
+# Si no existe, usamos los parámetros clásicos del benchmark.
+def load_params_from_excel(path="benchmark.xlsm", sheet_name="Welded beam Design"):
+    try:
+        import pandas as pd
+    except ImportError:
+        print("pandas no instalado; usando parámetros por defecto.")
+        return None
+
+    if not os.path.exists(path):
+        print(f"No se encontró '{path}' en la carpeta actual; usando parámetros por defecto.")
+        return None
+
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        # Intentamos detectar parámetros en el excel si están explicitados.
+        # Como el Excel puede tener formato libre, hacemos una búsqueda simple por palabras clave.
+        text = df.astype(str).fillna("").values.flatten()
+        joined = " ".join(text).lower()
+        params = {}
+        # Ejemplo de búsqueda muy básica (si el Excel contiene "P=6000" o "P 6000" etc.)
+        for key in ["P", "L", "E", "G"]:
+            # no garantizado; es un intento benigno
+            pass
+        # Si no encontramos nada útil devolvemos None
+        print("Excel leído, pero no se encontraron parámetros válidos de forma automática. Usando por defecto.")
+        return None
+    except Exception as e:
+        print("Error al leer Excel:", e)
+        return None
+
+# -----------------------------
+# PARÁMETROS (por defecto)
+# -----------------------------
+# Si tu Excel especifica otros valores, copia y pega aquí esos números.
+params_from_excel = load_params_from_excel()  # intenta leer, si falla devuelve None
+
+# Parámetros clásicos del benchmark (si no hay Excel o no contiene parámetros)
+P = 6000.0     # carga (lb)
+L = 14.0       # longitud (in)
+E = 30e6       # módulo Young (psi)
+G = 12e6       # módulo de corte (psi)
+
+# -----------------------------
+# Función objetivo + restricciones
+# -----------------------------
+def welded_beam_objective(x):
+    """
+    x: array-like [x1, x2, x3, x4] donde:
+      x1 = h (throat thickness of weld)
+      x2 = l (length of weld)
+      x3 = t (height of beam)
+      x4 = b (width of beam)
+    Retorna:
+      (penalized_value, raw_objective, list_of_g_constraints, aux_dict)
+    """
+    x1, x2, x3, x4 = x
+    # función objetivo (costo)
+    f = 1.10471 * x1**2 * x2 + 0.04811 * x3 * x4 * (14.0 + x2)
+
+    # cálculos auxiliares según la formulación estándar
+    # tensión por corte (t1)
+    t1 = P / (math.sqrt(2) * x1 * x2)
+
+    # momento (M)
+    M = P * (L + 0.5 * x2)
+
+    # J (según formulaciones de benchmark)
+    # Atención: usar una forma que no conduzca a división por cero
+    # si x1,x2 pequeños, J puede quedar pequeño; PSO limitará a lb>0
+    J = 2.0 * (math.sqrt(2) * x1 * x2) * (x2**2 / 12.0 + 0.25 * (x1 + x3)**2)
+
+    R = math.sqrt(0.25 * (x2**2 + (x1 + x3)**2))
+    # tensión secundaria t2
+    if J == 0:
+        t2 = 1e9
+    else:
+        t2 = M * R / J
+
+    # esfuerzo cortante combinado (tau)
+    tau = math.sqrt(t1**2 + t1 * t2 * x2 / R + t2**2)
+
+    # esfuerzo normal (sigma)
+    sigma = 6.0 * P * L / (x3**2 * x4)
+
+    # deflexión aproximada (delta)
+    delta = 4.0 * P * L**3 / (E * x3**3 * x4)
+
+    # pandeo crítico aproximado (Pc) — expresión usada comúnmente en referencias
+    Pc = (4.013 * E * math.sqrt((x3**2 * x4**6) / 36.0) / (L**2)) * (1.0 - (x3 * 0.5 / L) * math.sqrt(E / (4.0 * G)))
+
+    # restricciones g_i <= 0 para ser factible
+    g1 = tau - 13600.0          # tau <= 13600
+    g2 = sigma - 30000.0        # sigma <= 30000
+    g3 = x1 - x4                # x1 <= x4  -> x1 - x4 <= 0
+    g4 = 0.10471 * x1**2 + 0.04811 * x3 * x4 * (14.0 + x2) - 5.0  # volumen/cost constraint
+    g5 = 0.125 - x1             # x1 >= 0.125 -> 0.125 - x1 <= 0
+    g6 = delta - 0.25           # deflection <= 0.25
+    g7 = P - Pc                 # Pc >= P -> P - Pc <= 0
+
+    gs = [g1, g2, g3, g4, g5, g6, g7]
+
+    # Penalización: suma de violaciones positivas (simple y efectiva)
+    penalty = sum(max(0.0, g) for g in gs)
+    PEN = 1e8
+    penalized_value = f + PEN * penalty
+
+    aux = {'tau': tau, 'sigma': sigma, 'delta': delta, 'Pc': Pc}
+    return penalized_value, f, gs, aux
+
+# -----------------------------
+# PSO básico (sin argparse)
+# -----------------------------
+def run_pso_basic():
+    np.random.seed(42)  # para reproducibilidad
+
+    n_particles = 60
+    n_iter = 250
+    w = 0.7
+    c1 = 1.4
+    c2 = 1.4
+
+    # Límites para cada variable (x1..x4)
+    lb = np.array([0.1, 0.1, 0.1, 0.1])
+    ub = np.array([2.0, 10.0, 10.0, 2.0])
+    dim = 4
+
+    # inicializar posiciones y velocidades
+    X = lb + (ub - lb) * np.random.rand(n_particles, dim)
+    V = np.zeros((n_particles, dim))
+
+    # valores personales y global
+    pbest = X.copy()
+    pbest_val = np.array([welded_beam_objective(x)[0] for x in X])
+    gbest_idx = int(np.argmin(pbest_val))
+    gbest = pbest[gbest_idx].copy()
+    gbest_val = pbest_val[gbest_idx]
+
+    history = []
+
+    for it in range(n_iter):
+        for i in range(n_particles):
+            r1 = np.random.rand(dim)
+            r2 = np.random.rand(dim)
+            V[i] = w * V[i] + c1 * r1 * (pbest[i] - X[i]) + c2 * r2 * (gbest - X[i])
+
+            # limitar velocidad
+            vmax = (ub - lb) * 0.2
+            V[i] = np.maximum(np.minimum(V[i], vmax), -vmax)
+
+            # actualizar posición
+            X[i] = X[i] + V[i]
+            # truncar a límites
+            X[i] = np.maximum(np.minimum(X[i], ub), lb)
+
+            # evaluar y actualizar pbest
+            val = welded_beam_objective(X[i])[0]
+            if val < pbest_val[i]:
+                pbest[i] = X[i].copy()
+                pbest_val[i] = val
+
+        # actualizar gbest
+        idx = int(np.argmin(pbest_val))
+        if pbest_val[idx] < gbest_val:
+            gbest_val = pbest_val[idx]
+            gbest = pbest[idx].copy()
+
+        history.append(gbest_val)
+
+    # resultado final
+    pen, raw, gs, aux = welded_beam_objective(gbest)
+    return gbest, pen, raw, gs, aux, history
+
+# -----------------------------
+# Guardar resultados en disco (opcional)
+# -----------------------------
+def save_results(result, out_dir="results_welded"):
+    os.makedirs(out_dir, exist_ok=True)
+    out_json = os.path.join(out_dir, "welded_beam_result.json")
+    data = {
+        'x': result[0].tolist(),
+        'penalized_obj': float(result[1]),
+        'raw_obj': float(result[2]),
+        'constraints': [float(g) for g in result[3]],
+        'aux': result[4]
+    }
+    with open(out_json, "w") as f:
+        json.dump(data, f, indent=2)
+    print("Resultados guardados en:", out_json)
+
+# -----------------------------
+# Bloque principal
+# -----------------------------
+if __name__ == "__main__":
+    print("Ejecutando PSO (Welded Beam Design) — versión simple para VS Code")
+    best_x, penalized_val, raw_val, constraints, aux, history = run_pso_basic()
+
+    print("\nMejor solución encontrada (x1, x2, x3, x4):")
+    print(best_x)
+    print(f"Costo (raw): {raw_val:.6f}")
+    print(f"Costo (penalizado): {penalized_val:.6f}")
+    print("\nRestricciones (g1..g7) — deben ser <= 0 para factibilidad:")
+    for i, g in enumerate(constraints, start=1):
+        print(f" g{i} = {g:.6f}")
+    print("\nValores auxiliares (tau, sigma, delta, Pc):")
+    for k,v in aux.items():
+        print(f" {k} = {v:.6f}")
+
+    # Guardar resultado
+    save_results((best_x, penalized_val, raw_val, constraints, aux, history))
+
+    # Graficar convergencia si matplotlib está instalado.
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6,4))
+        plt.plot(history)
+        plt.xlabel("Iteración")
+        plt.ylabel("Mejor valor penalizado (gbest)")
+        plt.title("Convergencia PSO - Welded Beam (simple)")
+        plt.grid(True)
+        plt.show()
+    except Exception:
+        print("matplotlib no disponible. Instala 'matplotlib' para ver la gráfica.")
